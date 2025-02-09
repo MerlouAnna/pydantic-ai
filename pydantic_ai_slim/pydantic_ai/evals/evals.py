@@ -1,5 +1,6 @@
 from __future__ import annotations as _annotations
 
+import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar, Token
@@ -50,55 +51,71 @@ class _ScoringContext:
 
 
 
-@contextmanager
-def scoring_attributes(attributes: dict[str, Any]) -> Iterator[None]:
-    existing_attributes = _SCORING_ATTRIBUTES_CONTEXT.get()
-    token = _SCORING_ATTRIBUTES_CONTEXT.set({**existing_attributes, **attributes})
-    try:
-        yield
-    finally:
-        _SCORING_ATTRIBUTES_CONTEXT.reset(token)
-
-
 P = ParamSpec('P')
 T = TypeVar('T')
 
 
 @dataclass
-class ScoredResult(Generic[T]):
+class ScoreableCall(Generic[T]):
     function: Callable[..., T]
     inputs: Any
     output: T
 
-    scores: dict[str, int | float]
+    scores: dict[str, bool | int | float | str]
 
-    trace_id: str
-    span_id: str
-    attributes: dict[str, Any]
+    call_id: str  # f'{trace_id}:{span_id}' of relevant span
+    example_id: str | None = None
+    
+    def __post_init__(self):
+        eval_context = _EVAL_CONTEXT.get()
+        if eval_context is not None:
+            eval_context.scoreable_calls.append(self)
+
+    def set_score(self, name: str, value: float | int) -> None:
+        self.scores[name] = value
 
 
 @dataclass(init=False)
 class EvalContext:
     _eval_token: Token[Any] | None = None
-    _scoring_attributes_token: Token[Any] | None = None
-
+    
     def __init__(self, attributes: dict[str, Any]):
-        self.attributes = attributes
-        self.scored_function_calls: list[ScoredResult] = []
+        self.attributes = {**attributes, 'eval_id': uuid.uuid4()}
+        self.scoreable_calls: list[ScoreableCall] = []
 
     def __enter__(self):
-        self._scoring_attributes_token = _SCORING_ATTRIBUTES_CONTEXT.set(self.attributes)
         self._eval_token = _EVAL_CONTEXT.set(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        assert self._scoring_attributes_token is not None
-        _SCORING_ATTRIBUTES_CONTEXT.reset(self._scoring_attributes_token)
         assert self._eval_token is not None
         _EVAL_CONTEXT.reset(self._eval_token)
 
+    def get_calls_data(self):
+        data = {}
+        for call in self.scoreable_calls:
+            if call.function not in data:
+                data[call.function] = {}
+            data_for_function = data[call.function]
+            if call.example_id not in data_for_function:
+                data_for_function[call.example_id] = {}
+            else:
+                raise ValueError(f"Multiple calls to same function with the same example_id: {call}")
+            data_for_function[call.example_id] = call.scores
+        return data
 
-class ScoreableFunction(Generic[P, T]):
+    def print_summary(self):
+        data = self.get_calls_data()
+        for function, examples in data.items():
+            print(f"Function: {function}")
+            # TODO: Need to format the following as a table
+            for example_id, scores in examples.items():
+                print(f"  Example: {example_id}")
+                for score_name, score_value in scores.items():
+                    print(f"    {score_name}: {score_value}")
+
+
+class Scoreable(Generic[P, T]):
     """
     Decorator for a function. If applied, should ensure enough information is recorded to do scoring later.
 
@@ -117,22 +134,15 @@ class ScoreableFunction(Generic[P, T]):
 
     Still need APIs for performing post-hoc scoring, recording feedback, consuming scores, and consuming feedback.
     """
-    def __init__(self, f: Callable[P, T], scorers: dict[str, Callable[[T], int | float]]):
+    def __init__(self, f: Callable[P, T]):
         self.f = f
-        self.scorers = scorers
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> T:
-        return self.call_with_scoring(*args, **kwargs).scores
+        return self.call_for_scoring(*args, **kwargs).output
 
-    def with_scorers(
-        self, scorers: dict[str, Callable[[T], int | float]], replace: bool = False
-    ) -> ScoreableFunction[P, T]:
-        # This provides a way to have example-specific scorers, e.g. during benchmark-like evals
-        new_scorers = scorers if replace else {**self.scorers, **scorers}
-        return ScoreableFunction(self.f, new_scorers)
-
-    def call_with_scoring(self, *args: P.args, **kwargs: P.kwargs) -> ScoredResult[T]:
-        attributes = _SCORING_ATTRIBUTES_CONTEXT.get()
+    def call_for_scoring(self, *args: P.args, **kwargs: P.kwargs) -> ScoreableCall[T]:
+        # eval = _EVAL_CONTEXT.get()
+        # attributes = {} if eval is None else eval.attributes
 
         with ExitStack() as _stack:
             # TODO: if otel is installed, start a span here in _stack with attributes, and store its trace and span_ids;
@@ -144,22 +154,28 @@ class ScoreableFunction(Generic[P, T]):
             with _ScoringContext() as scoring_context:
                 result = self.f(*args, **kwargs)
 
-            for name, output_scorer in self.scorers.items():
-                scoring_context.set_score(name, output_scorer(result))
-
-            return ScoredResult(self.f, (args, kwargs), result, scoring_context.scores, trace_id, span_id, attributes)
+            return ScoreableCall(self.f, (args, kwargs), result, scoring_context.scores, f'{trace_id}:{span_id}')
 
 
-def set_score(name: str, value: float | int) -> None:
+def set_score(name: str, value: bool | int | float | str) -> None:
+    """Set a score on all currently-active scoring contexts."""
     for scoring_context in _SCORING_CONTEXTS.get():
         scoring_context.set_score(name, value)
 
 
 def add_count(name: str, amount: int) -> None:
+    """Increment a count metric on all currently-active scoring contexts."""
     for scoring_context in _SCORING_CONTEXTS.get():
         scoring_context.add_count(name, amount)
 
 
 _EVAL_CONTEXT = ContextVar[EvalContext | None]('_EVAL_CONTEXT', default=None)
-_SCORING_ATTRIBUTES_CONTEXT = ContextVar[dict[str, Any]]('_SCORING_ATTRIBUTES', default={})
 _SCORING_CONTEXTS = ContextVar[tuple[_ScoringContext, ...]]('_SCORING_CONTEXTS', default=())
+
+def record_score(name: str, trace_id: str, span_id: str, value: float | int | bool | str, comment: str | None) -> None:
+    """
+    Using this approach allows you to record scores flexibly.
+
+    Note: We still need to support 
+    """
+    pass
