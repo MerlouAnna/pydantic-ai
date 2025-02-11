@@ -4,7 +4,7 @@ import asyncio
 import dataclasses
 import uuid
 from abc import ABC
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import field
@@ -22,9 +22,9 @@ from . import (
     exceptions,
     messages as _messages,
     models,
-    result,
     usage as _usage,
 )
+from .models import MarkFinalResult, ModelRequestParameters, StreamedResponse
 from .result import ResultDataT
 from .settings import ModelSettings, merge_model_settings
 from .tools import (
@@ -55,21 +55,6 @@ EndStrategy = Literal['early', 'exhaustive']
 """
 DepsT = TypeVar('DepsT')
 ResultT = TypeVar('ResultT')
-
-
-@dataclasses.dataclass
-class MarkFinalResult(Generic[ResultDataT]):
-    """Marker class to indicate that the result is the final result.
-
-    This allows us to use `isinstance`, which wouldn't be possible if we were returning `ResultDataT` directly.
-
-    It also avoids problems in the case where the result type is itself `None`, but is set.
-    """
-
-    data: ResultDataT
-    """The final result data."""
-    tool_name: str | None
-    """Name of the final result tool, None if the result is a string."""
 
 
 @dataclasses.dataclass
@@ -124,7 +109,7 @@ class BaseUserPromptNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], N
     async def _get_first_message(
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, Any]]
     ) -> _messages.ModelRequest:
-        run_context = _build_run_context(ctx)
+        run_context = build_run_context(ctx)
         history, next_message = await self._prepare_messages(self.user_prompt, ctx.state.message_history, run_context)
         ctx.state.message_history = history
         run_context.messages = history
@@ -197,12 +182,12 @@ class UserPromptNode(BaseUserPromptNode[DepsT, NodeRunEndT]):
         return ModelRequestNode[DepsT, NodeRunEndT](request=await self._get_first_message(ctx))
 
 
-@dataclasses.dataclass
-class StreamUserPromptNode(BaseUserPromptNode[DepsT, NodeRunEndT]):
-    async def run(
-        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, Any]]
-    ) -> StreamModelRequestNode[DepsT, NodeRunEndT]:
-        return StreamModelRequestNode[DepsT, NodeRunEndT](request=await self._get_first_message(ctx))
+# @dataclasses.dataclass
+# class StreamUserPromptNode(BaseUserPromptNode[DepsT, NodeRunEndT]):
+#     async def run(
+#         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, Any]]
+#     ) -> StreamModelRequestNode[DepsT, NodeRunEndT]:
+#         return StreamModelRequestNode[DepsT, NodeRunEndT](request=await self._get_first_message(ctx))
 
 
 async def _prepare_request_parameters(
@@ -211,7 +196,7 @@ async def _prepare_request_parameters(
     """Build tools and create an agent model."""
     function_tool_defs: list[ToolDefinition] = []
 
-    run_context = _build_run_context(ctx)
+    run_context = build_run_context(ctx)
 
     async def add_tool(tool: Tool[DepsT]) -> None:
         ctx = run_context.replace_with(retry=tool.current_retry, tool_name=tool.name)
@@ -223,7 +208,7 @@ async def _prepare_request_parameters(
     result_schema = ctx.deps.result_schema
     return models.ModelRequestParameters(
         function_tools=function_tool_defs,
-        allow_text_result=_allow_text_result(result_schema),
+        allow_text_result=allow_text_result(result_schema),
         result_tools=result_schema.tool_defs() if result_schema is not None else [],
     )
 
@@ -234,9 +219,69 @@ class ModelRequestNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], Nod
 
     request: _messages.ModelRequest
 
+    _result: HandleResponseNode[DepsT, NodeRunEndT] | None = field(default=None, repr=False)
+    _did_stream: bool = field(default=False, repr=False)
+
     async def run(
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
     ) -> HandleResponseNode[DepsT, NodeRunEndT]:
+        if self._result is not None:
+            return self._result
+
+        if self._did_stream:
+            # `self._result` gets set when exiting the `stream` contextmanager, so hitting this
+            # means that the stream was started but not finished before `run()` was called
+            raise exceptions.AgentRunError('You must finish streaming before calling run()')
+
+        return await self._make_request(ctx)
+
+    @asynccontextmanager
+    async def stream(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, Any]]
+    ) -> AsyncIterator[StreamedResponse]:
+        if self._did_stream:
+            raise exceptions.AgentRunError('stream() can only be called once')
+
+        model_settings, model_request_parameters = await self._prepare_request(ctx)
+        with _logfire.span('model request', run_step=ctx.state.run_step) as span:
+            async with ctx.deps.model.request_stream(
+                ctx.state.message_history, model_settings, model_request_parameters
+            ) as streamed_response:
+                self._did_stream = True
+                ctx.state.usage.incr(_usage.Usage(), requests=1)
+                yield streamed_response
+                # In case the user didn't manually consume the full stream, ensure it is fully consumed here,
+                # otherwise usage won't be properly counted:
+                async for _ in streamed_response:
+                    pass
+            model_response = streamed_response.get()
+            request_usage = streamed_response.usage()
+            span.set_attribute('response', model_response)
+            span.set_attribute('usage', request_usage)
+
+        self._finish_handling(ctx, model_response, request_usage)
+        assert self._result is not None  # this should be set by the previous line
+
+    async def _make_request(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> HandleResponseNode[DepsT, NodeRunEndT]:
+        if self._result is not None:
+            return self._result
+
+        model_settings, model_request_parameters = await self._prepare_request(ctx)
+        with _logfire.span('model request', run_step=ctx.state.run_step) as span:
+            model_response, request_usage = await ctx.deps.model.request(
+                ctx.state.message_history, model_settings, model_request_parameters
+            )
+            ctx.state.usage.incr(_usage.Usage(), requests=1)
+            span.set_attribute('response', model_response)
+            span.set_attribute('usage', request_usage)
+
+        return self._finish_handling(ctx, model_response, request_usage)
+
+    async def _prepare_request(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> tuple[ModelSettings | None, ModelRequestParameters]:
         ctx.state.message_history.append(self.request)
 
         # Check usage
@@ -246,26 +291,29 @@ class ModelRequestNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], Nod
         # Increment run_step
         ctx.state.run_step += 1
 
+        model_settings = merge_model_settings(ctx.deps.model_settings, None)
         with _logfire.span('preparing model request params {run_step=}', run_step=ctx.state.run_step):
             model_request_parameters = await _prepare_request_parameters(ctx)
+        return model_settings, model_request_parameters
 
-        # Actually make the model request
-        model_settings = merge_model_settings(ctx.deps.model_settings, None)
-        with _logfire.span('model request') as span:
-            model_response, request_usage = await ctx.deps.model.request(
-                ctx.state.message_history, model_settings, model_request_parameters
-            )
-            span.set_attribute('response', model_response)
-            span.set_attribute('usage', request_usage)
-
+    def _finish_handling(
+        self,
+        ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]],
+        response: _messages.ModelResponse,
+        usage: _usage.Usage,
+    ) -> HandleResponseNode[DepsT, NodeRunEndT]:
         # Update usage
-        ctx.state.usage.incr(request_usage, requests=1)
+        ctx.state.usage.incr(usage, requests=0)
         if ctx.deps.usage_limits:
             ctx.deps.usage_limits.check_tokens(ctx.state.usage)
 
         # Append the model response to state.message_history
-        ctx.state.message_history.append(model_response)
-        return HandleResponseNode(model_response)
+        ctx.state.message_history.append(response)
+
+        # Set the `_result` attribute since we can't use `return` in an async iterator
+        self._result = HandleResponseNode(response)
+
+        return self._result
 
 
 @dataclasses.dataclass
@@ -283,7 +331,7 @@ class HandleResponseNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], N
     async def run(
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
     ) -> Union[ModelRequestNode[DepsT, NodeRunEndT], FinalResultNode[DepsT, NodeRunEndT]]:  # noqa UP007
-        async with self.run_stream(ctx):
+        async with self.stream(ctx):
             pass
 
         # the stream should set `self._next_node` before it ends:
@@ -291,7 +339,7 @@ class HandleResponseNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], N
         return next_node
 
     @asynccontextmanager
-    async def run_stream(
+    async def stream(
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, Any]]
     ) -> AsyncIterator[AsyncIterator[_messages.HandleResponseEvent]]:
         with _logfire.span('handle model response', run_step=ctx.state.run_step) as handle_span:
@@ -378,7 +426,7 @@ class HandleResponseNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], N
 
         # Then build the other request parts based on end strategy
         tool_responses: list[_messages.ModelRequestPart] = self._tool_responses
-        async for event in _process_function_tools(
+        async for event in process_function_tools(
             tool_calls, final_result and final_result.tool_name, ctx, tool_responses
         ):
             yield event
@@ -398,7 +446,7 @@ class HandleResponseNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], N
         result_schema = ctx.deps.result_schema
 
         text = '\n\n'.join(texts)
-        if _allow_text_result(result_schema):
+        if allow_text_result(result_schema):
             result_data_input = cast(NodeRunEndT, text)
             try:
                 result_data = await _validate_result(result_data_input, ctx, None)
@@ -420,134 +468,134 @@ class HandleResponseNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], N
             )
 
 
-@dataclasses.dataclass
-class StreamModelRequestNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], NodeRunEndT]):
-    """Make a request to the model using the last message in state.message_history (or a specified request)."""
-
-    request: _messages.ModelRequest
-    _result: StreamModelRequestNode[DepsT, NodeRunEndT] | End[result.StreamedRunResult[DepsT, NodeRunEndT]] | None = (
-        field(default=None, repr=False)
-    )
-
-    async def run(
-        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
-    ) -> Union[StreamModelRequestNode[DepsT, NodeRunEndT], End[result.StreamedRunResult[DepsT, NodeRunEndT]]]:  # noqa UP007
-        if self._result is not None:
-            return self._result
-
-        async with self.run_to_result(ctx) as final_node:
-            return final_node
-
-    @asynccontextmanager
-    async def run_to_result(
-        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
-    ) -> AsyncIterator[StreamModelRequestNode[DepsT, NodeRunEndT] | End[result.StreamedRunResult[DepsT, NodeRunEndT]]]:
-        result_schema = ctx.deps.result_schema
-
-        ctx.state.message_history.append(self.request)
-
-        # Check usage
-        if ctx.deps.usage_limits:
-            ctx.deps.usage_limits.check_before_request(ctx.state.usage)
-
-        # Increment run_step
-        ctx.state.run_step += 1
-
-        with _logfire.span('preparing model and tools {run_step=}', run_step=ctx.state.run_step):
-            model_request_parameters = await _prepare_request_parameters(ctx)
-
-        # Actually make the model request
-        model_settings = merge_model_settings(ctx.deps.model_settings, None)
-        with _logfire.span('model request {run_step=}', run_step=ctx.state.run_step) as model_req_span:
-            async with ctx.deps.model.request_stream(
-                ctx.state.message_history, model_settings, model_request_parameters
-            ) as streamed_response:
-                ctx.state.usage.requests += 1
-                model_req_span.set_attribute('response_type', streamed_response.__class__.__name__)
-                # We want to end the "model request" span here, but we can't exit the context manager
-                # in the traditional way
-                model_req_span.__exit__(None, None, None)
-
-                with _logfire.span('handle model response') as handle_span:
-                    received_text = False
-
-                    async for maybe_part_event in streamed_response:
-                        if isinstance(maybe_part_event, _messages.PartStartEvent):
-                            new_part = maybe_part_event.part
-                            if isinstance(new_part, _messages.TextPart):
-                                received_text = True
-                                if _allow_text_result(result_schema):
-                                    handle_span.message = 'handle model response -> final result'
-                                    streamed_run_result = _build_streamed_run_result(streamed_response, None, ctx)
-                                    self._result = End(streamed_run_result)
-                                    yield self._result
-                                    return
-                            elif isinstance(new_part, _messages.ToolCallPart):
-                                if result_schema is not None and (match := result_schema.find_tool([new_part])):
-                                    call, _ = match
-                                    handle_span.message = 'handle model response -> final result'
-                                    streamed_run_result = _build_streamed_run_result(
-                                        streamed_response, call.tool_name, ctx
-                                    )
-                                    self._result = End(streamed_run_result)
-                                    yield self._result
-                                    return
-                            else:
-                                assert_never(new_part)
-
-                    tasks: list[asyncio.Task[_messages.ModelRequestPart]] = []
-                    parts: list[_messages.ModelRequestPart] = []
-                    model_response = streamed_response.get()
-                    if not model_response.parts:
-                        raise exceptions.UnexpectedModelBehavior('Received empty model response')
-                    ctx.state.message_history.append(model_response)
-
-                    run_context = _build_run_context(ctx)
-                    for p in model_response.parts:
-                        if isinstance(p, _messages.ToolCallPart):
-                            if tool := ctx.deps.function_tools.get(p.tool_name):
-                                tasks.append(asyncio.create_task(tool.run(p, run_context), name=p.tool_name))
-                            else:
-                                parts.append(_unknown_tool(p.tool_name, ctx))
-
-                    if received_text and not tasks and not parts:
-                        # Can only get here if self._allow_text_result returns `False` for the provided result_schema
-                        ctx.state.increment_retries(ctx.deps.max_result_retries)
-                        self._result = StreamModelRequestNode[DepsT, NodeRunEndT](
-                            _messages.ModelRequest(
-                                parts=[
-                                    _messages.RetryPromptPart(
-                                        content='Plain text responses are not permitted, please call one of the functions instead.',
-                                    )
-                                ]
-                            )
-                        )
-                        yield self._result
-                        return
-
-                    with _logfire.span('running {tools=}', tools=[t.get_name() for t in tasks]):
-                        task_results: Sequence[_messages.ModelRequestPart] = await asyncio.gather(*tasks)
-                        parts.extend(task_results)
-
-                    next_request = _messages.ModelRequest(parts=parts)
-                    if any(isinstance(part, _messages.RetryPromptPart) for part in parts):
-                        try:
-                            ctx.state.increment_retries(ctx.deps.max_result_retries)
-                        except:
-                            # TODO: This is janky, so I think we should probably change it, but how?
-                            ctx.state.message_history.append(next_request)
-                            raise
-
-                    handle_span.set_attribute('tool_responses', parts)
-                    tool_responses_str = ' '.join(r.part_kind for r in parts)
-                    handle_span.message = f'handle model response -> {tool_responses_str}'
-                    # the model_response should have been fully streamed by now, we can add its usage
-                    streamed_response_usage = streamed_response.usage()
-                    run_context.usage.incr(streamed_response_usage)
-                    ctx.deps.usage_limits.check_tokens(run_context.usage)
-                    self._result = StreamModelRequestNode[DepsT, NodeRunEndT](next_request)
-                    yield self._result
-                    return
+# @dataclasses.dataclass
+# class StreamModelRequestNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], NodeRunEndT]):
+#     """Make a request to the model using the last message in state.message_history (or a specified request)."""
+#
+#     request: _messages.ModelRequest
+#     _result: StreamModelRequestNode[DepsT, NodeRunEndT] | End[result.StreamedRunResult[DepsT, NodeRunEndT]] | None = (
+#         field(default=None, repr=False)
+#     )
+#
+#     async def run(
+#         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+#     ) -> Union[StreamModelRequestNode[DepsT, NodeRunEndT], End[result.StreamedRunResult[DepsT, NodeRunEndT]]]:
+#         if self._result is not None:
+#             return self._result
+#
+#         async with self.run_to_result(ctx) as final_node:
+#             return final_node
+#
+#     @asynccontextmanager
+#     async def run_to_result(
+#         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+#     ) -> AsyncIterator[StreamModelRequestNode[DepsT, NodeRunEndT] | End[result.StreamedRunResult[DepsT, NodeRunEndT]]]:
+#         result_schema = ctx.deps.result_schema
+#
+#         ctx.state.message_history.append(self.request)
+#
+#         # Check usage
+#         if ctx.deps.usage_limits:
+#             ctx.deps.usage_limits.check_before_request(ctx.state.usage)
+#
+#         # Increment run_step
+#         ctx.state.run_step += 1
+#
+#         with _logfire.span('preparing model and tools {run_step=}', run_step=ctx.state.run_step):
+#             model_request_parameters = await _prepare_request_parameters(ctx)
+#
+#         # Actually make the model request
+#         model_settings = merge_model_settings(ctx.deps.model_settings, None)
+#         with _logfire.span('model request {run_step=}', run_step=ctx.state.run_step) as model_req_span:
+#             async with ctx.deps.model.request_stream(
+#                 ctx.state.message_history, model_settings, model_request_parameters
+#             ) as streamed_response:
+#                 ctx.state.usage.requests += 1
+#                 model_req_span.set_attribute('response_type', streamed_response.__class__.__name__)
+#                 # We want to end the "model request" span here, but we can't exit the context manager
+#                 # in the traditional way
+#                 model_req_span.__exit__(None, None, None)
+#
+#                 with _logfire.span('handle model response') as handle_span:
+#                     received_text = False
+#
+#                     async for maybe_part_event in streamed_response:
+#                         if isinstance(maybe_part_event, _messages.PartStartEvent):
+#                             new_part = maybe_part_event.part
+#                             if isinstance(new_part, _messages.TextPart):
+#                                 received_text = True
+#                                 if _allow_text_result(result_schema):
+#                                     handle_span.message = 'handle model response -> final result'
+#                                     streamed_run_result = _build_streamed_run_result(streamed_response, None, ctx)
+#                                     self._result = End(streamed_run_result)
+#                                     yield self._result
+#                                     return
+#                             elif isinstance(new_part, _messages.ToolCallPart):
+#                                 if result_schema is not None and (match := result_schema.find_tool([new_part])):
+#                                     call, _ = match
+#                                     handle_span.message = 'handle model response -> final result'
+#                                     streamed_run_result = _build_streamed_run_result(
+#                                         streamed_response, call.tool_name, ctx
+#                                     )
+#                                     self._result = End(streamed_run_result)
+#                                     yield self._result
+#                                     return
+#                             else:
+#                                 assert_never(new_part)
+#
+#                     tasks: list[asyncio.Task[_messages.ModelRequestPart]] = []
+#                     parts: list[_messages.ModelRequestPart] = []
+#                     model_response = streamed_response.get()
+#                     if not model_response.parts:
+#                         raise exceptions.UnexpectedModelBehavior('Received empty model response')
+#                     ctx.state.message_history.append(model_response)
+#
+#                     run_context = _build_run_context(ctx)
+#                     for p in model_response.parts:
+#                         if isinstance(p, _messages.ToolCallPart):
+#                             if tool := ctx.deps.function_tools.get(p.tool_name):
+#                                 tasks.append(asyncio.create_task(tool.run(p, run_context), name=p.tool_name))
+#                             else:
+#                                 parts.append(_unknown_tool(p.tool_name, ctx))
+#
+#                     if received_text and not tasks and not parts:
+#                         # Can only get here if self._allow_text_result returns `False` for the provided result_schema
+#                         ctx.state.increment_retries(ctx.deps.max_result_retries)
+#                         self._result = StreamModelRequestNode[DepsT, NodeRunEndT](
+#                             _messages.ModelRequest(
+#                                 parts=[
+#                                     _messages.RetryPromptPart(
+#                                         content='Plain text responses are not permitted, please call one of the functions instead.',
+#                                     )
+#                                 ]
+#                             )
+#                         )
+#                         yield self._result
+#                         return
+#
+#                     with _logfire.span('running {tools=}', tools=[t.get_name() for t in tasks]):
+#                         task_results: Sequence[_messages.ModelRequestPart] = await asyncio.gather(*tasks)
+#                         parts.extend(task_results)
+#
+#                     next_request = _messages.ModelRequest(parts=parts)
+#                     if any(isinstance(part, _messages.RetryPromptPart) for part in parts):
+#                         try:
+#                             ctx.state.increment_retries(ctx.deps.max_result_retries)
+#                         except:
+#                             # TODO: This is janky, so I think we should probably change it, but how?
+#                             ctx.state.message_history.append(next_request)
+#                             raise
+#
+#                     handle_span.set_attribute('tool_responses', parts)
+#                     tool_responses_str = ' '.join(r.part_kind for r in parts)
+#                     handle_span.message = f'handle model response -> {tool_responses_str}'
+#                     # the model_response should have been fully streamed by now, we can add its usage
+#                     streamed_response_usage = streamed_response.usage()
+#                     run_context.usage.incr(streamed_response_usage)
+#                     ctx.deps.usage_limits.check_tokens(run_context.usage)
+#                     self._result = StreamModelRequestNode[DepsT, NodeRunEndT](next_request)
+#                     yield self._result
+#                     return
 
 
 @dataclasses.dataclass
@@ -579,7 +627,7 @@ class FinalResultNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], Mark
         return End(self.data)
 
 
-def _build_run_context(ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, Any]]) -> RunContext[DepsT]:
+def build_run_context(ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, Any]]) -> RunContext[DepsT]:
     return RunContext[DepsT](
         deps=ctx.deps.user_deps,
         model=ctx.deps.model,
@@ -590,58 +638,7 @@ def _build_run_context(ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[Deps
     )
 
 
-def _build_streamed_run_result(
-    result_stream: models.StreamedResponse,
-    result_tool_name: str | None,
-    ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]],
-) -> result.StreamedRunResult[DepsT, NodeRunEndT]:
-    new_message_index = ctx.deps.new_message_index
-    result_schema = ctx.deps.result_schema
-    run_span = ctx.deps.run_span
-    usage_limits = ctx.deps.usage_limits
-    messages = ctx.state.message_history
-    run_context = _build_run_context(ctx)
-
-    async def on_complete():
-        """Called when the stream has completed.
-
-        The model response will have been added to messages by now
-        by `StreamedRunResult._marked_completed`.
-        """
-        last_message = messages[-1]
-        assert isinstance(last_message, _messages.ModelResponse)
-        tool_calls = [part for part in last_message.parts if isinstance(part, _messages.ToolCallPart)]
-
-        parts: list[_messages.ModelRequestPart] = []
-        async for _event in _process_function_tools(
-            tool_calls,
-            result_tool_name,
-            ctx,
-            parts,
-        ):
-            pass
-        # TODO: Should we do something here related to the retry count?
-        #   Maybe we should move the incrementing of the retry count to where we actually make a request?
-        # if any(isinstance(part, _messages.RetryPromptPart) for part in parts):
-        #     ctx.state.increment_retries(ctx.deps.max_result_retries)
-        if parts:
-            messages.append(_messages.ModelRequest(parts))
-        run_span.set_attribute('all_messages', messages)
-
-    return result.StreamedRunResult[DepsT, NodeRunEndT](
-        messages,
-        new_message_index,
-        usage_limits,
-        result_stream,
-        result_schema,
-        run_context,
-        ctx.deps.result_validators,
-        result_tool_name,
-        on_complete,
-    )
-
-
-async def _process_function_tools(
+async def process_function_tools(
     tool_calls: list[_messages.ToolCallPart],
     result_tool_name: str | None,
     ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]],
@@ -658,7 +655,7 @@ async def _process_function_tools(
 
     # we rely on the fact that if we found a result, it's the first result tool in the last
     found_used_result_tool = False
-    run_context = _build_run_context(ctx)
+    run_context = build_run_context(ctx)
 
     calls_to_run: list[tuple[Tool[DepsT], _messages.ToolCallPart]] = []
     call_index_to_event_id: dict[int, uuid.UUID] = {}
@@ -748,12 +745,12 @@ async def _validate_result(
     tool_call: _messages.ToolCallPart | None,
 ) -> T:
     for validator in ctx.deps.result_validators:
-        run_context = _build_run_context(ctx)
+        run_context = build_run_context(ctx)
         result_data = await validator.validate(result_data, tool_call, run_context)
     return result_data
 
 
-def _allow_text_result(result_schema: _result.ResultSchema[Any] | None) -> bool:
+def allow_text_result(result_schema: _result.ResultSchema[Any] | None) -> bool:
     return result_schema is None or result_schema.allow_text_result
 
 
@@ -825,17 +822,17 @@ def build_agent_graph(
     return graph
 
 
-def build_agent_stream_graph(
-    name: str | None, deps_type: type[DepsT], result_type: type[ResultT] | None
-) -> Graph[GraphAgentState, GraphAgentDeps[DepsT, Any], result.StreamedRunResult[DepsT, Any]]:
-    nodes = [
-        StreamUserPromptNode[DepsT, result.StreamedRunResult[DepsT, ResultT]],
-        StreamModelRequestNode[DepsT, result.StreamedRunResult[DepsT, ResultT]],
-    ]
-    graph = Graph[GraphAgentState, GraphAgentDeps[DepsT, Any], result.StreamedRunResult[DepsT, Any]](
-        nodes=nodes,
-        name=name or 'Agent',
-        state_type=GraphAgentState,
-        run_end_type=result.StreamedRunResult[DepsT, result_type],
-    )
-    return graph
+# def build_agent_stream_graph(
+#     name: str | None, deps_type: type[DepsT], result_type: type[ResultT] | None
+# ) -> Graph[GraphAgentState, GraphAgentDeps[DepsT, Any], result.StreamedRunResult[DepsT, Any]]:
+#     nodes = [
+#         StreamUserPromptNode[DepsT, result.StreamedRunResult[DepsT, ResultT]],
+#         StreamModelRequestNode[DepsT, result.StreamedRunResult[DepsT, ResultT]],
+#     ]
+#     graph = Graph[GraphAgentState, GraphAgentDeps[DepsT, Any], result.StreamedRunResult[DepsT, Any]](
+#         nodes=nodes,
+#         name=name or 'Agent',
+#         state_type=GraphAgentState,
+#         run_end_type=result.StreamedRunResult[DepsT, result_type],
+#     )
+#     return graph
