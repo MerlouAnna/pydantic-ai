@@ -10,7 +10,17 @@ from dataclasses import dataclass
 from pydantic import BaseModel, Field
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.models.openai import OpenAIModel
 
+from openai import AsyncAzureOpenAI
+
+client = AsyncAzureOpenAI(
+    azure_endpoint='https://openaianna.openai.azure.com/',
+    api_version='2024-08-01-preview',
+    api_key='67e3af673a0c4c1c8ec6ae454d8fe9f4',
+)
+
+model = OpenAIModel('gpt-4o', openai_client=client)
 
 class DatabaseConn:
     """This is a fake database for example purposes.
@@ -45,7 +55,7 @@ class SupportResult(BaseModel):
 
 
 support_agent = Agent(
-    'openai:gpt-4o',
+    model = model,
     deps_type=SupportDependencies,
     result_type=SupportResult,
     system_prompt=(

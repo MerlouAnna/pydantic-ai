@@ -84,6 +84,9 @@ only-include = ["/README.md"]
 [tool.hatch.build.targets.sdist]
 include = ["/README.md", "/Makefile", "/tests"]
 
+[tool.poetry.dependencies]
+python = ">=3.9,<4.0"
+
 [tool.ruff]
 line-length = 120
 target-version = "py39"
